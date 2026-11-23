@@ -1,0 +1,9 @@
+groups:
+  - name: orders
+    rules:
+      - alert: PricingFailures
+        expr: increase(orders_total{status="failed"}[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "pricing failed for {{ $value }} order(s) in 5 minutes"

@@ -1,0 +1,155 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.1.0
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        pip install --quiet psycopg2-binary &&
+        DB_PASS=$$(tr -d '\r\n' < /run/secrets/db_password) &&
+        exec mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri "postgresql+psycopg2://${POSTGRES_USER}:$${DB_PASS}@postgres:5432/mlflow" --serve-artifacts --artifacts-destination /mlartifacts
+    secrets:
+      - db_password
+    volumes:
+      - mlartifacts:/mlartifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:5000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  kb-api:
+    build:
+      context: .
+      dockerfile: kb-service/Dockerfile
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-orders}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    ports:
+      - "127.0.0.1:8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  trainer:
+    build:
+      context: .
+      dockerfile: training_service/Dockerfile
+    profiles: ["train"]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_EXPERIMENT_NAME: house-price
+      MODEL_NAME: ${MODEL_NAME:-house-price}
+      MODEL_ALIAS: ${MODEL_ALIAS:-prod}
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  forecast-api:
+    build:
+      context: .
+      dockerfile: forecast-service/Dockerfile
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME:-house-price}
+      MODEL_ALIAS: ${MODEL_ALIAS:-prod}
+      KB_API_URL: http://kb-api:8002
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      kb-api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  orders-api:
+    build:
+      context: .
+      dockerfile: orders-service/Dockerfile
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_DB: ${POSTGRES_DB}
+      FORECAST_URL: http://forecast-api:8001
+      FORECAST_TIMEOUT: ${FORECAST_TIMEOUT:-3.0}
+    ports:
+      - "${ORDERS_PORT:-8000}:8000"
+    secrets:
+      - db_password
+      - jwt_secret_key
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v3.3.1
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - orders-api
+      - forecast-api
+      - kb-api
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_password
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    secrets:
+      - grafana_password
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  pgdata:
+  mlartifacts:
+
+secrets:
+  db_password:
+    file: ./secrets/db_password
+  jwt_secret_key:
+    file: ./secrets/jwt_secret_key
+  grafana_password:
+    file: ./secrets/grafana_password.txt

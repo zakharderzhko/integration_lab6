@@ -1,0 +1,9 @@
+# monitoring/grafana/provisioning/dashboards/provider.yml
+apiVersion: 1
+providers:
+  - name: default
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 5
+    options:
+      path: /var/lib/grafana/dashboards
